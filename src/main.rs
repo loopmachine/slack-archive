@@ -1,6 +1,8 @@
-extern crate chrono;
 #[macro_use]
 extern crate failure;
+
+extern crate chrono;
+extern crate rusqlite;
 extern crate slack_api as slack;
 extern crate walkdir;
 
