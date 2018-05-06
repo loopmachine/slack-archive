@@ -4,7 +4,26 @@ use failure::{Error, ResultExt};
 use slack;
 use rusqlite;
 
+/// Number of messages to return for each pagination query
 const PAGE_SIZE: u32 = 1000; // max allowed by slack api
+
+/// The expected time window between when a message is first written
+/// and when it is last edited.
+///
+/// Since there isn't a direct way to search for messages that have been
+/// edited, we search for all messages starting at EDIT_WINDOW_MINUTES
+/// before the last archive time. The results can include duplicate
+/// messages, some of which may be edits.
+///
+/// Edits made outside of this time window will not be captured.
+///
+/// Setting this to 0 ensures that no edits will be captured, and
+/// zero duplicate messages will be fetched.
+///
+/// Setting this to a very high number ensures that all edits are
+/// captured, but the entire message history is fetched on every
+/// archive run (duplicate messages are deduped when stored).
+const EDIT_WINDOW_MINUTES: i64 = 60;
 
 pub fn archive() -> Result<(), Error> {
     let token = env::var("SLACK_API_TOKEN").expect("SLACK_API_TOKEN not set.");
@@ -50,9 +69,9 @@ fn archive_channel(
     // page forward starting from last saved ts
     let mut oldest_ts = match get_last_ts(db, channel_id)? {
         // first run: force slack to start from the oldest results
-        None => Some("1".to_string()),
-        // later runs: start from last saved msg ts
-        ts @ _ => ts,
+        None => 1,
+        // later runs: start from last saved msg ts - edit window
+        Some(ts) => ts - (EDIT_WINDOW_MINUTES * 60 * 1_000_000),
     };
 
     loop {
@@ -61,7 +80,7 @@ fn archive_channel(
             client,
             &token,
             &slack::channels::HistoryRequest {
-                oldest: oldest_ts.as_ref().map(String::as_str),
+                oldest: Some(&unix_micros_to_slack_ts(oldest_ts)),
                 latest: None,
                 channel: channel_id,
                 count: Some(PAGE_SIZE),
@@ -77,8 +96,10 @@ fn archive_channel(
 
             // messages are returned in desc time order.
             // use the latest message timestamp as the starting point
-            // for the next page query.
-            oldest_ts = message_ts(&messages[0]).clone();
+            // for the next pagination query.
+            if let Some(ts) = message_ts(&messages[0]) {
+                oldest_ts = ts;
+            }
 
             // iterate through messages in asc time order
             for message in messages.into_iter().rev() {
@@ -86,13 +107,18 @@ fn archive_channel(
                     slack::Message::Standard(msg) => {
                         db.execute(
                             "
-                            INSERT INTO message (`channel_id`, `ts`, `from`, `text`)
+                            INSERT OR REPLACE INTO message (`channel_id`, `ts`, `from`, `text`)
                             VALUES (?1, ?2, ?3, ?4)
                                 ",
-                            &[&channel_id, &msg.ts, &msg.user, &msg.text],
+                            &[
+                                &channel_id,
+                                &slack_ts_to_unix_micros(&msg.ts.unwrap()),
+                                &msg.user,
+                                &msg.text,
+                            ],
                         )?;
                     }
-                    _ => continue, // skip over other message types
+                    _ => continue, // skip over non-standard messages
                 }
             }
         }
@@ -105,6 +131,16 @@ fn archive_channel(
     Ok(())
 }
 
+fn slack_ts_to_unix_micros(ts: &str) -> i64 {
+    let (seconds, micros) = ts.split_at(10);
+    (seconds.parse::<i64>().unwrap() * 1_000_000) + micros[1..].parse::<i64>().unwrap()
+}
+
+fn unix_micros_to_slack_ts(micros: i64) -> String {
+    let (seconds, micros) = (micros / 1_000_000, micros % 1_000_000);
+    format!("{:010}.{:06}", seconds, micros)
+}
+
 pub fn init_db(path: &str) -> Result<rusqlite::Connection, Error> {
     let db = rusqlite::Connection::open(path)?;
     println!("{:?}", db);
@@ -112,11 +148,11 @@ pub fn init_db(path: &str) -> Result<rusqlite::Connection, Error> {
     db.execute(
         "
         CREATE TABLE IF NOT EXISTS `message` (
-            `id` INTEGER PRIMARY KEY,
             `channel_id` TEXT NOT NULL,
-            `ts` TEXT NOT NULL,
+            `ts` INTEGER NOT NULL,
             `from` TEXT NOT NULL,
-            `text` BLOB
+            `text` BLOB,
+            PRIMARY KEY(`channel_id`, `ts`)
         )",
         &[],
     )?;
@@ -134,7 +170,7 @@ pub fn init_db(path: &str) -> Result<rusqlite::Connection, Error> {
     Ok(db)
 }
 
-fn get_last_ts(db: &rusqlite::Connection, channel_id: &str) -> Result<Option<String>, Error> {
+fn get_last_ts(db: &rusqlite::Connection, channel_id: &str) -> Result<Option<i64>, Error> {
     match db.query_row(
         "SELECT ts FROM message where channel_id = ? ORDER BY ts DESC LIMIT 1",
         &[&channel_id],
@@ -146,9 +182,9 @@ fn get_last_ts(db: &rusqlite::Connection, channel_id: &str) -> Result<Option<Str
     }
 }
 
-fn message_ts(message: &slack::Message) -> &Option<String> {
+fn message_ts(message: &slack::Message) -> Option<i64> {
     // this is exhausting
-    match *message {
+    let msg_ts = match *message {
         slack::Message::BotMessage(ref msg) => &msg.ts,
         slack::Message::ChannelArchive(ref msg) => &msg.ts,
         slack::Message::ChannelJoin(ref msg) => &msg.ts,
@@ -175,5 +211,9 @@ fn message_ts(message: &slack::Message) -> &Option<String> {
         slack::Message::ReplyBroadcast(ref msg) => &msg.ts,
         slack::Message::Standard(ref msg) => &msg.ts,
         slack::Message::UnpinnedItem(ref msg) => &msg.ts,
+    };
+    match *msg_ts {
+        Some(ref ts_str) => Some(slack_ts_to_unix_micros(&ts_str)),
+        _ => None,
     }
 }
