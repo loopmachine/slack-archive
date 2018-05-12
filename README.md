@@ -1,10 +1,10 @@
-# Slack Archiver
+# Slack Archive
 
 Create a local archive of your slack messages. Slack admin privileges not required.
 
 ## Install
 
-```console
+```
 cargo install
 ```
 
@@ -14,7 +14,7 @@ First, [Generate a Slack API token](https://api.slack.com/custom-integrations/le
 
 Then, run the archive command save all messages since the last run. Archived messages are not duplicated.
 
-```console
+```
 TOKEN=<slack api token> \
 DB_PATH=</path/to/your.db> \
 slack_archive
