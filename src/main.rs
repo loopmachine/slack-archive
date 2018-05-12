@@ -31,13 +31,14 @@ fn main() {
 
 fn run() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        return Err(format_err!("specify command: `archive` or `search`"));
-    }
-
-    match args[1].as_ref() {
-        "archive" => archive::archive(),
-        "search" => search::search(),
-        cmd @ _ => Err(format_err!("invalid command: {}", cmd)),
+    if args.len() > 1 {
+        match args[1].as_ref() {
+            "archive" => archive::archive(),
+            "search" => search::search(),
+            cmd @ _ => Err(format_err!("invalid command: {}", cmd)),
+        }
+    } else {
+        // default cmd
+        archive::archive()
     }
 }

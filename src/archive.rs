@@ -26,19 +26,54 @@ const PAGE_SIZE: u32 = 1000; // max allowed by slack api
 const EDIT_WINDOW_MINUTES: i64 = 60;
 
 pub fn archive() -> Result<(), Error> {
-    let token = env::var("SLACK_API_TOKEN").expect("SLACK_API_TOKEN not set.");
-    let data_dir = env::var("DATA_DIR").unwrap_or("./data".to_string());
-    let client = slack::default_client().unwrap();
+    let token = match env::var("TOKEN") {
+        Ok(t) => t,
+        Err(_) => bail!(
+            "TOKEN is not set. Get your token from \
+             https://api.slack.com/custom-integrations/legacy-tokens"
+        ),
+    };
 
-    let db_path = format!("{}/archive.db", data_dir);
+    let db_path = match env::var("DB_PATH") {
+        Ok(path) => path,
+        Err(_) => bail!(
+            "DB_PATH is not set. \
+             Set this to the location where want to save your messages, \
+             i.e. ~/slack/archive.db"
+        ),
+    };
+
+    let client = slack::default_client().unwrap();
     let db = init_db(&db_path)?;
 
-    archive_all(&db, &client, &token)?;
+    archive_users(&db, &client, &token)?;
+    archive_channels(&db, &client, &token)?;
 
     return Ok(());
 }
 
-pub fn archive_all(
+pub fn archive_users(
+    db: &rusqlite::Connection,
+    client: &slack::requests::Client,
+    token: &str,
+) -> Result<(), Error> {
+    let response = slack::users::list(client, token, &slack::users::ListRequest::default())?;
+
+    if let Some(users) = response.members {
+        for user in users {
+            db.execute(
+                "
+                INSERT OR REPLACE INTO user (`id`, `name`, `real_name`, `is_admin`)
+                VALUES (?1, ?2, ?3, ?4)
+                ",
+                &[&user.id, &user.name, &user.real_name, &user.is_admin],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn archive_channels(
     db: &rusqlite::Connection,
     client: &slack::requests::Client,
     token: &str,
@@ -47,13 +82,8 @@ pub fn archive_all(
 
     if let Some(channels) = response.channels {
         for channel in channels {
-            if let (Some(id), Some(name)) = (channel.id, channel.name) {
-                if name != "general" {
-                    continue;
-                }
-                println!("Archiving channel: {} ({})", name, id);
-                archive_channel(db, client, token, &id)?;
-            }
+            println!("Archiving channel: {}", channel.name.as_ref().unwrap());
+            archive_channel(db, client, token, &channel)?;
         }
     }
     db.execute("PRAGMA optimize;", &[])?;
@@ -64,10 +94,19 @@ fn archive_channel(
     db: &rusqlite::Connection,
     client: &slack::requests::Client,
     token: &str,
-    channel_id: &str,
+    channel: &slack::Channel,
 ) -> Result<(), Error> {
+    db.execute(
+        "
+        INSERT OR REPLACE INTO channel (`id`, `name`)
+        VALUES (?1, ?2)
+        ",
+        &[&channel.id, &channel.name],
+    )?;
+    let channel_id = channel.id.as_ref().unwrap();
+
     // page forward starting from last saved ts
-    let mut oldest_ts = match get_last_ts(db, channel_id)? {
+    let mut oldest_ts = match get_last_ts(db, &channel_id)? {
         // first run: force slack to start from the oldest results
         None => 1,
         // later runs: start from last saved msg ts - edit window
@@ -75,21 +114,21 @@ fn archive_channel(
     };
 
     loop {
-        println!("query from: {:?}", oldest_ts);
+        // println!("query from: {:?}", oldest_ts);
         let response = slack::channels::history(
             client,
             &token,
             &slack::channels::HistoryRequest {
                 oldest: Some(&unix_micros_to_slack_ts(oldest_ts)),
                 latest: None,
-                channel: channel_id,
+                channel: &channel_id,
                 count: Some(PAGE_SIZE),
                 ..slack::channels::HistoryRequest::default()
             },
         )?;
 
         if let Some(messages) = response.messages {
-            println!("Got {} messages", messages.len());
+            // println!("Got {} messages", messages.len());
             if messages.len() == 0 {
                 break;
             }
@@ -111,7 +150,7 @@ fn archive_channel(
                             VALUES (?1, ?2, ?3, ?4)
                                 ",
                             &[
-                                &channel_id,
+                                &channel.id,
                                 &slack_ts_to_unix_micros(&msg.ts.unwrap()),
                                 &msg.user,
                                 &msg.text,
@@ -143,7 +182,28 @@ fn unix_micros_to_slack_ts(micros: i64) -> String {
 
 pub fn init_db(path: &str) -> Result<rusqlite::Connection, Error> {
     let db = rusqlite::Connection::open(path)?;
-    println!("{:?}", db);
+
+    db.execute(
+        "
+        CREATE TABLE IF NOT EXISTS `user` (
+            `id` TEXT NOT NULL,
+            `name` TEXT NOT NULL,
+            `real_name` TEXT,
+            `is_admin` INTEGER,
+            PRIMARY KEY(`id`)
+        )",
+        &[],
+    )?;
+
+    db.execute(
+        "
+        CREATE TABLE IF NOT EXISTS `channel` (
+            `id` TEXT NOT NULL,
+            `name` TEXT NOT NULL,
+            PRIMARY KEY(`id`)
+        )",
+        &[],
+    )?;
 
     db.execute(
         "
